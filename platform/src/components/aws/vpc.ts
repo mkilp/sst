@@ -161,6 +161,8 @@ export interface VpcArgs {
            * Use this to provide a custom role with additional permissions or to comply with
            * organizational policies.
            *
+           * Cannot be used together with `instanceProfile`.
+           *
            * @default A new IAM role is created
            * @example
            * ```ts
@@ -174,6 +176,28 @@ export interface VpcArgs {
            * ```
            */
           role?: Input<string>;
+          /**
+           * The name of an existing IAM instance profile to use for the NAT instance.
+           *
+           * By default, a new IAM instance profile is created. Use this to provide an
+           * existing instance profile instead of creating a new one, or to comply with
+           * organizational policies.
+           *
+           * Cannot be used together with `role`.
+           *
+           * @default A new IAM instance profile is created
+           * @example
+           * ```ts
+           * {
+           *   nat: {
+           *     ec2: {
+           *       instanceProfile: "my-nat-instance-profile"
+           *     }
+           *   }
+           * }
+           * ```
+           */
+          instanceProfile?: Input<string>;
         }>;
       }
   >;
@@ -504,23 +528,19 @@ export class Vpc extends Component implements Link.Linkable {
       const securityGroup = ec2.SecurityGroup.get(
         `${name}SecurityGroup`,
         all([
-          ec2
-            .getSecurityGroupsOutput(
-              {
-                filters: [
-                  { name: "group-name", values: ["default"] },
-                  { name: "vpc-id", values: [vpcId] },
-                ],
-              },
-              { parent: self },
-            )
-            .ids,
+          ec2.getSecurityGroupsOutput(
+            {
+              filters: [
+                { name: "group-name", values: ["default"] },
+                { name: "vpc-id", values: [vpcId] },
+              ],
+            },
+            { parent: self },
+          ).ids,
           vpcId,
         ]).apply(([ids, vpcId]) => {
           if (!ids.length) {
-            throw new VisibleError(
-              `Security group not found in VPC ${vpcId}`,
-            );
+            throw new VisibleError(`Security group not found in VPC ${vpcId}`);
           }
           return ids[0];
         }),
@@ -634,11 +654,16 @@ export class Vpc extends Component implements Link.Linkable {
           },
           { parent: self },
         )
-        .ids.apply((ids) => 
-          ids.length 
-            ? ec2.SecurityGroup.get(`${name}NatInstanceSecurityGroup`, ids[0], undefined, {
-              parent: self
-            })
+        .ids.apply((ids) =>
+          ids.length
+            ? ec2.SecurityGroup.get(
+                `${name}NatInstanceSecurityGroup`,
+                ids[0],
+                undefined,
+                {
+                  parent: self,
+                },
+              )
             : undefined,
         );
       const elasticIps = all([natGateways, natInstances]).apply(
@@ -708,11 +733,16 @@ export class Vpc extends Component implements Link.Linkable {
           },
           { parent: self },
         )
-        .ids.apply((ids) => 
-          ids.length 
-            ? ec2.SecurityGroup.get(`${name}BastionSecurityGroup`, ids[0], undefined, {
-              parent: self
-            })
+        .ids.apply((ids) =>
+          ids.length
+            ? ec2.SecurityGroup.get(
+                `${name}BastionSecurityGroup`,
+                ids[0],
+                undefined,
+                {
+                  parent: self,
+                },
+              )
             : undefined,
         );
 
@@ -855,7 +885,12 @@ export class Vpc extends Component implements Link.Linkable {
         if (nat === "ec2") {
           return {
             type: "ec2" as const,
-            ec2: { instance: "t4g.nano", ami: undefined, role: undefined },
+            ec2: {
+              instance: "t4g.nano",
+              ami: undefined,
+              role: undefined,
+              instanceProfile: undefined,
+            },
           };
         }
         if (nat) {
@@ -874,6 +909,11 @@ export class Vpc extends Component implements Link.Linkable {
               `The number of Elastic IP allocation IDs must match the number of AZs.`,
             );
 
+          if (nat.ec2?.role && nat.ec2?.instanceProfile)
+            throw new VisibleError(
+              `The "nat.ec2.role" and "nat.ec2.instanceProfile" cannot both be specified.`,
+            );
+
           return nat.ec2 || nat.type === "ec2"
             ? {
                 type: "ec2" as const,
@@ -882,6 +922,7 @@ export class Vpc extends Component implements Link.Linkable {
                   instance: nat.ec2?.instance ?? "t4g.nano",
                   ami: nat.ec2?.ami,
                   role: nat.ec2?.role,
+                  instanceProfile: nat.ec2?.instanceProfile,
                 },
               }
             : {
@@ -1097,41 +1138,49 @@ export class Vpc extends Component implements Link.Linkable {
           ),
         );
 
-        const role = nat.ec2.role
-          ? iam.Role.get(
-              `${name}NatInstanceRole`,
-              nat.ec2.role,
+        const instanceProfile = nat.ec2.instanceProfile
+          ? iam.InstanceProfile.get(
+              `${name}NatInstanceProfile`,
+              nat.ec2.instanceProfile,
               {},
               { parent: self },
             )
-          : new iam.Role(
-              `${name}NatInstanceRole`,
-              {
-                assumeRolePolicy: iam.getPolicyDocumentOutput({
-                  statements: [
+          : (() => {
+              const role = nat.ec2.role
+                ? iam.Role.get(
+                    `${name}NatInstanceRole`,
+                    nat.ec2.role,
+                    {},
+                    { parent: self },
+                  )
+                : new iam.Role(
+                    `${name}NatInstanceRole`,
                     {
-                      actions: ["sts:AssumeRole"],
-                      principals: [
-                        {
-                          type: "Service",
-                          identifiers: ["ec2.amazonaws.com"],
-                        },
+                      assumeRolePolicy: iam.getPolicyDocumentOutput({
+                        statements: [
+                          {
+                            actions: ["sts:AssumeRole"],
+                            principals: [
+                              {
+                                type: "Service",
+                                identifiers: ["ec2.amazonaws.com"],
+                              },
+                            ],
+                          },
+                        ],
+                      }).json,
+                      managedPolicyArns: [
+                        interpolate`arn:${partition}:iam::aws:policy/AmazonSSMManagedInstanceCore`,
                       ],
                     },
-                  ],
-                }).json,
-                managedPolicyArns: [
-                  interpolate`arn:${partition}:iam::aws:policy/AmazonSSMManagedInstanceCore`,
-                ],
-              },
-              { parent: self },
-            );
-
-        const instanceProfile = new iam.InstanceProfile(
-          `${name}NatInstanceProfile`,
-          { role: role.name },
-          { parent: self },
-        );
+                    { parent: self },
+                  );
+              return new iam.InstanceProfile(
+                `${name}NatInstanceProfile`,
+                { role: role.name },
+                { parent: self },
+              );
+            })();
 
         const ami =
           nat.ec2.ami ??
@@ -1154,8 +1203,22 @@ export class Vpc extends Component implements Link.Linkable {
             { parent: self },
           ).id;
 
-        return all([zones, publicSubnets, elasticIps, keyPair, bastion, natSecurityGroup]).apply(
-          ([zones, publicSubnets, elasticIps, keyPair, bastion, natSecurityGroup]) => ({
+        return all([
+          zones,
+          publicSubnets,
+          elasticIps,
+          keyPair,
+          bastion,
+          natSecurityGroup,
+        ]).apply(
+          ([
+            zones,
+            publicSubnets,
+            elasticIps,
+            keyPair,
+            bastion,
+            natSecurityGroup,
+          ]) => ({
             natInstances: zones.map((_, i) => {
               const instance = new ec2.Instance(
                 ...transform(
@@ -1366,53 +1429,53 @@ export class Vpc extends Component implements Link.Linkable {
             ),
           );
 
-          const instanceProfile = output(
-            bastion.instanceProfileName,
-          ).apply((instanceProfileName) => {
-            if (instanceProfileName) {
-              if (instanceProfileName.startsWith("arn:")) {
-                throw new VisibleError(
-                  "Bastion instance profile must be a name, not an ARN.",
+          const instanceProfile = output(bastion.instanceProfileName).apply(
+            (instanceProfileName) => {
+              if (instanceProfileName) {
+                if (instanceProfileName.startsWith("arn:")) {
+                  throw new VisibleError(
+                    "Bastion instance profile must be a name, not an ARN.",
+                  );
+                }
+
+                return iam.InstanceProfile.get(
+                  `${name}BastionProfile`,
+                  instanceProfileName,
+                  {},
+                  { parent: self },
                 );
               }
 
-              return iam.InstanceProfile.get(
-                `${name}BastionProfile`,
-                instanceProfileName,
-                {},
+              const role = new iam.Role(
+                `${name}BastionRole`,
+                {
+                  assumeRolePolicy: iam.getPolicyDocumentOutput({
+                    statements: [
+                      {
+                        actions: ["sts:AssumeRole"],
+                        principals: [
+                          {
+                            type: "Service",
+                            identifiers: ["ec2.amazonaws.com"],
+                          },
+                        ],
+                      },
+                    ],
+                  }).json,
+                  managedPolicyArns: [
+                    interpolate`arn:${partition}:iam::aws:policy/AmazonSSMManagedInstanceCore`,
+                  ],
+                },
                 { parent: self },
               );
-            }
 
-            const role = new iam.Role(
-              `${name}BastionRole`,
-              {
-                assumeRolePolicy: iam.getPolicyDocumentOutput({
-                  statements: [
-                    {
-                      actions: ["sts:AssumeRole"],
-                      principals: [
-                        {
-                          type: "Service",
-                          identifiers: ["ec2.amazonaws.com"],
-                        },
-                      ],
-                    },
-                  ],
-                }).json,
-                managedPolicyArns: [
-                  interpolate`arn:${partition}:iam::aws:policy/AmazonSSMManagedInstanceCore`,
-                ],
-              },
-              { parent: self },
-            );
-
-            return new iam.InstanceProfile(
-              `${name}BastionProfile`,
-              { role: role.name },
-              { parent: self },
-            );
-          });
+              return new iam.InstanceProfile(
+                `${name}BastionProfile`,
+                { role: role.name },
+                { parent: self },
+              );
+            },
+          );
 
           const ami = ec2.getAmiOutput(
             {
@@ -1441,9 +1504,7 @@ export class Vpc extends Component implements Link.Linkable {
                 ami: ami.id,
                 subnetId: publicSubnets.apply((v) => v[0].id),
                 vpcSecurityGroupIds: [bastionSecurityGroup.id],
-                iamInstanceProfile: instanceProfile.apply(
-                  (ip) => ip.name,
-                ),
+                iamInstanceProfile: instanceProfile.apply((ip) => ip.name),
                 keyName: keyPair?.keyName,
                 tags: {
                   "sst:is-bastion": "true",
